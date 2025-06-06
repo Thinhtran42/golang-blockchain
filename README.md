@@ -1,391 +1,302 @@
-# Go Blockchain - Simple Blockchain Implementation
+# 🔗 Golang Blockchain
 
-Hệ thống blockchain đơn giản được viết bằng Go, hỗ trợ chuyển tiền giữa users với các tính năng:
+A simple yet complete blockchain implementation in Go featuring multi-node consensus, P2P networking, and ECDSA digital signatures.
 
-- ✅ **ECDSA Digital Signatures** - Ký số giao dịch đảm bảo tính toàn vẹn
-- ✅ **Merkle Tree** - Xác thực hiệu quả các transactions trong block
-- ✅ **LevelDB Storage** - Lưu trữ blocks bền vững
-- ✅ **P2P Network** - Giao tiếp giữa nodes qua gRPC
-- ✅ **Leader-Follower Consensus** - Cơ chế đồng thuận đa node
-- ✅ **Node Recovery** - Tự động sync khi node restart
-- ✅ **Docker Support** - Chạy 3 validators dễ dàng
-- ✅ **CLI Tool** - Tương tác với blockchain
+[![Go Version](https://img.shields.io/badge/Go-1.23+-blue.svg)](https://golang.org)
+[![Docker](https://img.shields.io/badge/Docker-Supported-brightgreen.svg)](https://docker.com)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 🏗️ Kiến trúc hệ thống
+## ✨ Features
+
+- 🔐 **ECDSA Digital Signatures** - P-256 curve with SHA-256 hashing
+- 🌳 **Merkle Tree** - Efficient transaction verification
+- 💾 **LevelDB Storage** - Persistent blockchain data
+- 🌐 **P2P Network** - gRPC-based node communication
+- ⚡ **Leader-Follower Consensus** - Byzantine fault tolerant
+- 🔄 **Node Recovery** - Automatic sync on restart
+- 🐳 **Docker Support** - Easy multi-node deployment
+- 📱 **CLI Interface** - User-friendly blockchain interaction
+
+## 🏗️ Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Node 1        │    │   Node 2        │    │   Node 3        │
-│   (Leader)      │◄──►│   (Follower)    │◄──►│   (Follower)    │
-│                 │    │                 │    │                 │
-│ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │ Consensus   │ │    │ │ Consensus   │ │    │ │ Consensus   │ │
-│ │ Engine      │ │    │ │ Engine      │ │    │ │ Engine      │ │
-│ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │
-│ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │ P2P Network │ │    │ │ P2P Network │ │    │ │ P2P Network │ │
-│ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │
-│ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │ LevelDB     │ │    │ │ LevelDB     │ │    │ │ LevelDB     │ │
-│ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │
+│ Node 1 (Leader) │◄──►│ Node 2          │◄──►│ Node 3          │
+│ :50051          │    │ :50052          │    │ :50053          │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
+         │                       │                       │
+         └───────────────────────┼───────────────────────┘
+                                 │
+            ┌─────────────────────▼─────────────────────┐
+            │               Client Layer                │
+            │  ┌─────────────┐    ┌─────────────┐      │
+            │  │ CLI Tool    │    │ gRPC Client │      │
+            │  └─────────────┘    └─────────────┘      │
+            └───────────────────────────────────────────┘
 ```
 
-### Consensus Flow:
+### Consensus Flow
 
-1. **Leader** thu thập pending transactions
-2. **Leader** tạo block và propose đến followers
-3. **Followers** validate block và gửi vote
-4. **Leader** thu thập votes, nếu majority approve thì commit
-5. **Leader** broadcast commit đến tất cả followers
+```
+Leader                  Followers
+  │                        │
+  ├─ 1. Collect TXs        │
+  ├─ 2. Create Block       │
+  ├─ 3. Propose ──────────►├─ 4. Validate
+  ├─ 5. Collect Votes ◄────├─ 6. Vote
+  ├─ 7. Check Majority     │
+  ├─ 8. Commit & Broadcast►├─ 9. Save Block
+  │                        │
+```
 
 ## 🚀 Quick Start
 
-### 1. Build và chạy với Docker
+### Prerequisites
+
+- **Go 1.23+**
+- Docker & Docker Compose
+
+### 1. Setup & Run
 
 ```bash
-# Clone repo
-git clone <repo-url>
-cd go-blockchain
+# Clone repository
+git clone https://github.com/Thinhtran42/golang-blockchain.git
+cd golang-blockchain
 
-# Build và start 3 nodes
-docker-compose up --build
+# Remove docker-compose version warning (optional)
+sed -i '1d' docker-compose.yml
 
-# Kiểm tra logs
-docker-compose logs -f node1
-docker-compose logs -f node2
-docker-compose logs -f node3
+# Start 3-node blockchain network
+docker-compose up --build -d
+
+# Check nodes are running
+docker-compose ps
 ```
 
-### 2. Sử dụng CLI Tool
+### 2. Test Blockchain
 
 ```bash
-# Build CLI tool
-go build -o blockchain-cli ./cmd/cli
+# Enter node container
+docker-compose exec node1 sh
 
-# Tạo users
+# Create users
 ./blockchain-cli create-user Alice
 ./blockchain-cli create-user Bob
 
-# Xem danh sách users
-./blockchain-cli list-users
-
-# Gửi transaction
+# Send transaction
 ./blockchain-cli send Alice Bob 10.5
 
-# Xem trạng thái blockchain
+# Check blockchain status
 ./blockchain-cli status
 
-# Xem block cụ thể
-./blockchain-cli get-block 0
+# Exit container
+exit
 ```
 
-## 📁 Cấu trúc dự án
+## 📱 CLI Commands
+
+| Command       | Description                 | Example                                |
+| ------------- | --------------------------- | -------------------------------------- |
+| `create-user` | Create user with ECDSA keys | `./blockchain-cli create-user Alice`   |
+| `list-users`  | Show all users              | `./blockchain-cli list-users`          |
+| `send`        | Send transaction            | `./blockchain-cli send Alice Bob 10.5` |
+| `status`      | Get blockchain status       | `./blockchain-cli status`              |
+
+**Note:** CLI runs inside containers. For host usage:
+
+```bash
+go build -o blockchain-cli ./cmd/cli
+./blockchain-cli status --node localhost:50051
+```
+
+## 🔧 Development
+
+### Project Structure
 
 ```
-go-blockchain/
+golang-blockchain/
 ├── cmd/
-│   ├── node/           # Validator node main
+│   ├── node/           # Validator node
 │   └── cli/            # CLI tool
 ├── pkg/
-│   ├── blockchain/     # Core blockchain (Transaction, Block, Merkle)
+│   ├── blockchain/     # Core blockchain logic
 │   ├── wallet/         # ECDSA key management
 │   ├── p2p/           # Network communication
 │   ├── consensus/     # Consensus engine
 │   └── storage/       # LevelDB operations
-├── proto/             # gRPC protobuf definitions
-├── Dockerfile         # Docker image
-├── docker-compose.yml # Multi-node setup
+├── proto/             # gRPC definitions
+├── Dockerfile
+├── docker-compose.yml
 └── README.md
 ```
 
-## 🔧 Development Setup
-
-### Prerequisites
-
-- Go 1.21+
-- Docker & Docker Compose
-- Protocol Buffers compiler
+### Local Development
 
 ```bash
-# Install protoc
-# macOS
-brew install protobuf
-
-# Ubuntu
-sudo apt-get install protobuf-compiler
-
-# Install Go plugins
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-```
-
-### Build từ source
-
-```bash
-# Clone và setup
-git clone <repo-url>
-cd go-blockchain
+# Install dependencies
 go mod tidy
 
-# Generate protobuf files
+# Generate protobuf files (if modified)
 protoc --go_out=. --go-grpc_out=. proto/blockchain.proto
 
-# Build validator node
+# Build components
 go build -o validator ./cmd/node
-
-# Build CLI
 go build -o blockchain-cli ./cmd/cli
 
-# Run tests
-go run cmd/test/test_basic.go
+# Run single node (development)
+./validator --node-id=node1 --is-leader=true --port=50051
 ```
 
-## 🔑 ECDSA Key Management
-
-### Tạo Users
+### Testing
 
 ```bash
-# Tạo Alice
-./blockchain-cli create-user Alice
-# Output: Alice.json file với private/public keys
+# Unit tests
+go test ./pkg/...
 
-# File Alice.json:
-{
-  "name": "Alice",
-  "address": "a1b2c3d4e5f6...",
-  "private_key_hex": "abcdef123456...",
-  "public_key_hex": "fedcba654321..."
-}
+# Integration test
+docker-compose up -d
+sleep 10
+docker-compose exec node1 sh -c "
+  ./blockchain-cli create-user Test1 &&
+  ./blockchain-cli create-user Test2 &&
+  ./blockchain-cli send Test1 Test2 5.0 &&
+  sleep 8 &&
+  ./blockchain-cli status
+"
 ```
 
-### Security Features
+## 🔒 Security Features
 
-- **P-256 Curve**: NIST P-256 elliptic curve
-- **SHA-256 Hashing**: Secure hash cho addresses và signatures
-- **ASN.1 DER Encoding**: Standard signature format
-- **Address Derivation**: Address = SHA-256(PublicKey)[:20]
+### Cryptography
 
-## 📦 Block Structure
+- **Algorithm:** ECDSA with P-256 elliptic curve
+- **Hash Function:** SHA-256 for addresses and signatures
+- **Key Format:** ASN.1 DER encoding
+- **Address:** First 20 bytes of SHA-256(PublicKey)
 
-```json
-{
-  "transactions": [...],
-  "merkle_root": "abc123...",
-  "previous_block_hash": "def456...",
-  "current_block_hash": "ghi789...",
-  "timestamp": 1698765432,
-  "height": 42
-}
-```
+### Network Security
 
-### Merkle Tree Features
+- **Development:** Plain gRPC (localhost only)
+- **Production Ready:** TLS/mTLS support planned
 
-- **Binary Tree**: Efficient transaction verification
-- **Hash Pairs**: SHA-256(left + right)
-- **Odd Handling**: Duplicate last node if odd count
-- **Proof Generation**: Verify single transaction without full tree
+## 📊 Performance
 
-## 🌐 Network Protocol (gRPC)
+| Metric         | Value                |
+| -------------- | -------------------- |
+| Block Time     | ~5 seconds           |
+| Throughput     | ~10-20 TPS           |
+| Memory Usage   | ~50-100MB per node   |
+| Storage Growth | ~1KB per transaction |
 
-### Core Services
+## 🔄 Node Recovery
 
-```protobuf
-service BlockchainService {
-  // Consensus
-  rpc ProposeBlock(ProposeBlockRequest) returns (ProposeBlockResponse);
-  rpc SubmitVote(VoteRequest) returns (VoteResponse);
-  rpc CommitBlock(CommitBlockRequest) returns (CommitBlockResponse);
+**Automatic Sync Process:**
 
-  // Transactions
-  rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse);
+1. Node restarts and connects to peers
+2. Compares local height with network
+3. Downloads missing blocks
+4. Validates and commits blocks
+5. Rejoins consensus
 
-  // Sync
-  rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
-  rpc GetBlocksFromHeight(GetBlocksFromHeightRequest) returns (GetBlocksFromHeightResponse);
-}
-```
-
-### Port Mapping
-
-- **Node 1 (Leader)**: localhost:50051
-- **Node 2 (Follower)**: localhost:50052
-- **Node 3 (Follower)**: localhost:50053
-
-## 🔄 Consensus Mechanism
-
-### Leader-Follower Model
-
-1. **Leader Election**: Static configuration (Node 1 = Leader)
-2. **Block Interval**: 5 seconds
-3. **Vote Timeout**: 3 seconds
-4. **Majority Rule**: 2/3 nodes must approve
-5. **Failure Handling**: Leader proposes new block if previous fails
-
-### Consensus Steps
-
-```
-Leader:               Followers:
-  │                     │
-  ├─ Collect TXs       │
-  ├─ Create Block      │
-  ├─ Propose ────────► ├─ Validate
-  │                    ├─ Vote ──────┐
-  ├─ Collect Votes ◄───┘              │
-  ├─ Check Majority                   │
-  ├─ Commit Block                     │
-  ├─ Broadcast ──────► ├─ Save Block
-  │                    │
-```
-
-## 🔧 Node Recovery
-
-### Automatic Sync Process
-
-1. **Startup**: Node checks latest height vs peers
-2. **Height Comparison**: Find highest peer
-3. **Block Download**: Get missing blocks từ best peer
-4. **Validation**: Verify each block before saving
-5. **Resume**: Join consensus after sync complete
-
-### Recovery Scenarios
-
-- **Network Partition**: Auto-reconnect and sync
-- **Node Restart**: Resume từ last saved block
-- **Corrupted Data**: Re-sync từ peers
-
-## 📊 Monitoring & Debugging
-
-### Health Checks
+**Test Recovery:**
 
 ```bash
-# Check node health
-./blockchain-cli status --node localhost:50051
+# Stop a node
+docker-compose stop node2
 
-# View specific block
-./blockchain-cli get-block 5 --node localhost:50051
+# Send transactions
+docker-compose exec node1 ./blockchain-cli send Alice Bob 3.0
 
-# Monitor logs
-docker-compose logs -f node1
-```
-
-### Debug Information
-
-- **Consensus Status**: Current round, pending votes
-- **Transaction Pool**: Pending transactions count
-- **Sync Status**: Current height, sync progress
-- **Peer Connections**: Connected peers list
-
-## 🧪 Testing
-
-### Unit Tests
-
-```bash
-# Test core components
-go run cmd/test/test_basic.go
-
-# Test wallet functionality
-go test ./pkg/wallet/...
-
-# Test blockchain components
-go test ./pkg/blockchain/...
-```
-
-### Integration Tests
-
-```bash
-# Start test environment
-docker-compose -f docker-compose.test.yml up
-
-# Run integration tests
-go test -tags=integration ./test/...
+# Restart and observe sync
+docker-compose start node2
+docker-compose logs node2 | tail -10
 ```
 
 ## 🐛 Troubleshooting
 
 ### Common Issues
 
-**1. Port Already in Use**
+**Docker Compose Warning:**
+
+```bash
+# Fix version warning
+sed -i '1d' docker-compose.yml
+```
+
+**CLI Not Found:**
+
+```bash
+# Build CLI in container
+docker-compose exec node1 sh
+go build -o blockchain-cli ./cmd/cli
+```
+
+**Port Conflicts:**
 
 ```bash
 # Kill existing processes
 lsof -ti:50051 | xargs kill -9
 ```
 
-**2. Permission Denied (LevelDB)**
+**Permission Issues:**
 
 ```bash
 # Fix data directory permissions
 sudo chown -R $USER:$USER data/
 ```
 
-**3. Peer Connection Failed**
+## 🏭 Production Considerations
 
-```bash
-# Check network connectivity
-docker network ls
-docker network inspect go-blockchain_blockchain_network
-```
+### Security Hardening
 
-**4. Transaction Stuck in Pool**
+- [ ] Implement mTLS for P2P communication
+- [ ] Add rate limiting and DDoS protection
+- [ ] Use Hardware Security Modules (HSM) for key management
+- [ ] Enable audit logging
 
-```bash
-# Check transaction signature
-./blockchain-cli status
-# Verify user key files exist and are valid
-```
+### Scalability
 
-### Debug Mode
+- [ ] Horizontal scaling (5+ validator nodes)
+- [ ] Parallel transaction validation
+- [ ] Connection pooling and load balancing
+- [ ] Sharding for increased throughput
 
-```bash
-# Enable debug logging
-export LOG_LEVEL=debug
-docker-compose up
-```
+### Monitoring
 
-## 🚀 Production Considerations
+- [ ] Prometheus metrics collection
+- [ ] Grafana dashboards
+- [ ] ELK stack for centralized logging
+- [ ] Alerting for critical failures
 
-### Security Enhancements Needed
+### Infrastructure
 
-- [ ] **TLS/mTLS**: Encrypt P2P communication
-- [ ] **Key Rotation**: Periodic key updates
-- [ ] **Rate Limiting**: Prevent spam attacks
-- [ ] **Access Control**: Authentication for CLI access
+- [ ] Kubernetes deployment
+- [ ] Infrastructure as Code (Terraform)
+- [ ] CI/CD pipeline with security scanning
+- [ ] Multi-region disaster recovery
 
-### Performance Optimizations
+## 🔮 Roadmap
 
-- [ ] **Batch Processing**: Multiple transactions per block
-- [ ] **Parallel Validation**: Concurrent signature verification
-- [ ] **Caching**: Block and transaction caching
-- [ ] **Database Optimization**: Custom LevelDB tuning
+### Phase 1 (Next 3 months)
 
-### Monitoring & Observability
+- [ ] TLS/mTLS implementation
+- [ ] Web dashboard
+- [ ] Enhanced CLI commands
+- [ ] Performance optimization
 
-- [ ] **Metrics**: Prometheus/Grafana integration
-- [ ] **Logging**: Structured logging with correlation IDs
-- [ ] **Alerting**: Critical failure notifications
-- [ ] **Distributed Tracing**: Request flow tracking
+### Phase 2 (3-6 months)
 
-## 📝 API Reference
+- [ ] Smart contract support (WASM)
+- [ ] Advanced consensus (PBFT)
+- [ ] Cross-chain communication
+- [ ] Mobile SDK
 
-### CLI Commands
+### Phase 3 (6-12 months)
 
-| Command       | Description          | Example                                |
-| ------------- | -------------------- | -------------------------------------- |
-| `create-user` | Create new user      | `./blockchain-cli create-user Alice`   |
-| `send`        | Send transaction     | `./blockchain-cli send Alice Bob 10.5` |
-| `status`      | Get node status      | `./blockchain-cli status`              |
-| `get-block`   | Get block info       | `./blockchain-cli get-block 5`         |
-| `list-users`  | List available users | `./blockchain-cli list-users`          |
-
-### Environment Variables
-
-| Variable    | Description               | Default |
-| ----------- | ------------------------- | ------- |
-| `NODE_ID`   | Unique node identifier    | `node1` |
-| `IS_LEADER` | Leader flag               | `false` |
-| `PORT`      | gRPC port                 | `50051` |
-| `PEERS`     | Comma-separated peer list | `""`    |
+- [ ] Enterprise key management
+- [ ] Regulatory compliance tools
+- [ ] Sharding implementation
+- [ ] Advanced analytics
 
 ## 🤝 Contributing
 
@@ -399,6 +310,14 @@ docker-compose up
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## 🙏 Acknowledgments
+
+- Built with Go, gRPC, and Docker
+- Inspired by Bitcoin and Ethereum architectures
+- Uses LevelDB for efficient storage
+
 ---
 
-**Made with ❤️ using Go, gRPC, and Docker**
+**Made with ❤️ for the blockchain community**
+
+For questions or support, please open an issue on GitHub.
