@@ -1,18 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"golang-blockchain/pkg/blockchain"
+	"golang-blockchain/pkg/discovery"
 	"golang-blockchain/pkg/p2p"
 	"golang-blockchain/pkg/storage"
 	pb "golang-blockchain/proto"
@@ -34,6 +37,9 @@ type ValidatorNode struct {
 	// Consensus control
 	isProposing  bool
 	proposingMux sync.RWMutex
+
+	// Discovery client for auto-discovery
+	discoveryClient *discovery.Client
 }
 
 // NewValidatorNode tạo validator node mới
@@ -68,6 +74,25 @@ func (vn *ValidatorNode) GetID() string {
 // IsLeaderNode returns if this node is leader
 func (vn *ValidatorNode) IsLeaderNode() bool {
 	return vn.Node.IsLeader
+}
+
+// PromoteToLeader promotes this node to leader
+func (vn *ValidatorNode) PromoteToLeader() {
+	vn.proposingMux.Lock()
+	defer vn.proposingMux.Unlock()
+
+	vn.Node.IsLeader = true
+	log.Printf("Node %s promoted to leader", vn.GetID())
+}
+
+// DemoteToFollower demotes this node to follower
+func (vn *ValidatorNode) DemoteToFollower() {
+	vn.proposingMux.Lock()
+	defer vn.proposingMux.Unlock()
+
+	vn.Node.IsLeader = false
+	vn.isProposing = false // Stop any ongoing consensus activities
+	log.Printf("Node %s demoted to follower", vn.GetID())
 }
 
 // GetStorageInstance returns storage instance
@@ -419,71 +444,547 @@ func (vn *ValidatorNode) protoToBlock(protoBlock *pb.Block) *blockchain.Block {
 	}
 }
 
-func main() {
-	// Parse environment variables
-	nodeID := getEnvOrDefault("NODE_ID", "node1")
-	isLeaderStr := getEnvOrDefault("IS_LEADER", "false")
-	port := getEnvOrDefault("PORT", "50051")
-	peersStr := getEnvOrDefault("PEERS", "")
+// setupAutoDiscovery initializes auto-discovery for the node
+func (vn *ValidatorNode) setupAutoDiscovery(registryURL string) error {
+	log.Printf("Setting up auto-discovery with registry: %s", registryURL)
 
-	isLeader, _ := strconv.ParseBool(isLeaderStr)
+	// Get current height and pool size
+	currentHeight, _ := vn.storage.GetLatestHeight()
+	txPoolSize := int32(vn.txPool.GetTransactionCount())
 
-	// Parse peers
-	var peers []string
-	if peersStr != "" {
-		peers = strings.Split(peersStr, ",")
+	// Create node info for registration
+	nodeInfo := &discovery.NodeInfo{
+		ID:         vn.GetID(),
+		Address:    vn.GetID(), // Use node ID as address in Docker network
+		Port:       vn.Port,
+		IsLeader:   vn.IsLeaderNode(),
+		Height:     int32(currentHeight),
+		TxPoolSize: txPoolSize,
 	}
 
-	// Tạo database path
-	dbPath := fmt.Sprintf("data/%s_db", nodeID)
-	os.MkdirAll("data", 0755)
+	// Create discovery client
+	vn.discoveryClient = discovery.NewClient(registryURL, nodeInfo)
 
-	log.Printf("Starting validator node %s (Leader: %v) on port %s", nodeID, isLeader, port)
+	// Start auto-discovery loop
+	connectCallback := func(peers []string) error {
+		log.Printf("Discovered peers: %v", peers)
+		return vn.ConnectToPeers(peers)
+	}
 
-	// Tạo validator node
-	node, err := NewValidatorNode(nodeID, "0.0.0.0", port, isLeader, dbPath)
+	go vn.discoveryClient.AutoDiscoveryLoop(15*time.Second, connectCallback)
+
+	// Setup leadership change endpoint
+	vn.setupLeadershipEndpoint()
+
+	log.Printf("Auto-discovery setup completed")
+	return nil
+}
+
+// setupLeadershipEndpoint sets up HTTP endpoint for leadership notifications
+func (vn *ValidatorNode) setupLeadershipEndpoint() {
+	http.HandleFunc("/leadership", vn.handleLeadershipChange)
+	log.Printf("Leadership endpoint setup at :8080/leadership")
+}
+
+// handleLeadershipChange handles leadership change notifications from registry
+func (vn *ValidatorNode) handleLeadershipChange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var notification struct {
+		NewLeader bool   `json:"new_leader"`
+		Demoted   bool   `json:"demoted"`
+		NodeID    string `json:"node_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Check if this node is being promoted to leader
+	if notification.NewLeader && notification.NodeID == vn.GetID() {
+		log.Printf("🎯 Received leadership promotion notification!")
+
+		// Promote this node to leader
+		vn.PromoteToLeader()
+
+		// Start consensus loop
+		go vn.StartConsensusLoop()
+
+		log.Printf("✅ Successfully promoted to leader and started consensus")
+	}
+
+	// Check if this node is being demoted from leader
+	if notification.Demoted && notification.NodeID == vn.GetID() {
+		log.Printf("⬇️ Received leadership demotion notification!")
+
+		// Demote this node to follower
+		vn.DemoteToFollower()
+
+		log.Printf("✅ Successfully demoted to follower")
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "received",
+		"node_id": vn.GetID(),
+	})
+}
+
+// performAutoSync performs automatic synchronization with discovered peers
+func (vn *ValidatorNode) performAutoSync() {
+	log.Printf("Starting auto-sync process...")
+
+	// Wait for initial peer discovery
+	time.Sleep(10 * time.Second)
+
+	// Try to sync every 30 seconds until successful, then every 60 seconds for maintenance
+	syncTicker := time.NewTicker(30 * time.Second)
+	defer syncTicker.Stop()
+
+	isInitialSync := true
+
+	for {
+		select {
+		case <-syncTicker.C:
+			// Update discovery client with current status
+			if vn.discoveryClient != nil {
+				currentHeight, _ := vn.storage.GetLatestHeight()
+				txPoolSize := int32(vn.txPool.GetTransactionCount())
+				vn.discoveryClient.UpdateNodeInfo(int32(currentHeight), txPoolSize)
+			}
+
+			// Try to sync with peers
+			peers := vn.GetPeers()
+			if len(peers) > 0 {
+				log.Printf("Attempting sync with %d peers", len(peers))
+
+				// Check if we need aggressive sync for restarted nodes
+				needsAggressiveSync := vn.checkNeedsAggressiveSync(peers)
+
+				var err error
+				if needsAggressiveSync {
+					log.Printf("Detected restart or outdated state, performing aggressive sync")
+					err = vn.aggressiveSyncFromPeers(peers)
+				} else {
+					err = vn.syncBlockchainFromPeers()
+				}
+
+				if err != nil {
+					log.Printf("Sync attempt failed: %v", err)
+				} else {
+					log.Printf("Sync completed successfully")
+					if isInitialSync {
+						// After successful initial sync, check less frequently
+						syncTicker.Reset(60 * time.Second)
+						isInitialSync = false
+					}
+				}
+			} else {
+				log.Printf("No peers available for sync, waiting...")
+			}
+		}
+	}
+}
+
+// checkNeedsAggressiveSync determines if this node needs aggressive sync
+func (vn *ValidatorNode) checkNeedsAggressiveSync(peers []string) bool {
+	currentHeight, err := vn.storage.GetLatestHeight()
 	if err != nil {
-		log.Fatal("Failed to create validator node:", err)
+		// If we can't get height, we probably need to sync
+		return true
 	}
 
-	// Start node
-	if err := node.Start(); err != nil {
-		log.Fatal("Failed to start node:", err)
+	// Check if we're significantly behind any peer
+	for _, peerAddr := range peers {
+		client, exists := vn.getClient(peerAddr)
+		if !exists {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := client.GetLatestBlock(ctx, &pb.GetLatestBlockRequest{NodeId: vn.GetID()})
+		cancel()
+
+		if err != nil {
+			continue
+		}
+
+		if resp.Success {
+			peerHeight := int(resp.Height)
+			// If peer is more than 1 block ahead, we need aggressive sync
+			if peerHeight > currentHeight+1 {
+				log.Printf("Peer %s has height %d, we have %d - need aggressive sync", peerAddr, peerHeight, currentHeight)
+				return true
+			}
+		}
 	}
 
-	log.Printf("Node %s started successfully", nodeID)
+	return false
+}
 
-	// Wait for server to start
-	time.Sleep(2 * time.Second)
+// aggressiveSyncFromPeers performs complete blockchain sync for restarted nodes
+func (vn *ValidatorNode) aggressiveSyncFromPeers(peers []string) error {
+	log.Printf("Starting aggressive sync to catch up with network")
+
+	// Find the peer with highest height
+	var bestPeer string
+	var highestHeight int = -1
+
+	for _, peerAddr := range peers {
+		client, exists := vn.getClient(peerAddr)
+		if !exists {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := client.GetLatestBlock(ctx, &pb.GetLatestBlockRequest{NodeId: vn.GetID()})
+		cancel()
+
+		if err != nil {
+			log.Printf("Failed to get latest block from %s: %v", peerAddr, err)
+			continue
+		}
+
+		if resp.Success && int(resp.Height) > highestHeight {
+			highestHeight = int(resp.Height)
+			bestPeer = peerAddr
+		}
+	}
+
+	if bestPeer == "" {
+		return fmt.Errorf("no peers available for aggressive sync")
+	}
+
+	log.Printf("Best peer for sync: %s with height %d", bestPeer, highestHeight)
+
+	// Get our current height
+	currentHeight, err := vn.storage.GetLatestHeight()
+	if err != nil {
+		currentHeight = -1
+	}
+
+	// If we're already up to date, no need to sync
+	if currentHeight >= highestHeight {
+		log.Printf("Already synced with best peer (our height: %d, peer height: %d)", currentHeight, highestHeight)
+		return nil
+	}
+
+	// For aggressive sync, we'll sync all missing blocks
+	// In this implementation, we'll at least sync the latest block
+	client, exists := vn.getClient(bestPeer)
+	if !exists {
+		return fmt.Errorf("lost connection to best peer during sync")
+	}
+
+	// Sync the latest block (in a full implementation, you'd sync all missing blocks)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	resp, err := client.GetLatestBlock(ctx, &pb.GetLatestBlockRequest{NodeId: vn.GetID()})
+	cancel()
+
+	if err != nil {
+		return fmt.Errorf("failed to get latest block during aggressive sync: %v", err)
+	}
+
+	if !resp.Success || resp.Block == nil {
+		return fmt.Errorf("peer returned unsuccessful response during aggressive sync")
+	}
+
+	// Convert and validate the block
+	block := vn.protoToBlock(resp.Block)
+	if err := block.ValidateBlock(); err != nil {
+		return fmt.Errorf("invalid block received during aggressive sync: %v", err)
+	}
+
+	// Save the block
+	if err := vn.storage.SaveBlock(block); err != nil {
+		return fmt.Errorf("failed to save block during aggressive sync: %v", err)
+	}
+
+	log.Printf("Aggressive sync completed: synced to height %d from %s", block.Height, bestPeer)
+
+	// Force update our status with discovery client
+	if vn.discoveryClient != nil {
+		newHeight, _ := vn.storage.GetLatestHeight()
+		txPoolSize := int32(vn.txPool.GetTransactionCount())
+		vn.discoveryClient.UpdateNodeInfo(int32(newHeight), txPoolSize)
+		log.Printf("Updated registry with new height: %d", newHeight)
+	}
+
+	return nil
+}
+
+// syncBlockchainFromPeers syncs blockchain data from available peers
+func (vn *ValidatorNode) syncBlockchainFromPeers() error {
+	peers := vn.GetPeers()
+	if len(peers) == 0 {
+		return fmt.Errorf("no peers available for sync")
+	}
+
+	// Get current height
+	currentHeight, err := vn.storage.GetLatestHeight()
+	if err != nil {
+		currentHeight = -1
+	}
+
+	log.Printf("Current blockchain height: %d", currentHeight)
+
+	// Try to sync from each peer
+	for _, peerAddr := range peers {
+		client, exists := vn.getClient(peerAddr)
+		if !exists {
+			continue
+		}
+
+		// Get latest block from peer
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := client.GetLatestBlock(ctx, &pb.GetLatestBlockRequest{NodeId: vn.GetID()})
+		cancel()
+
+		if err != nil {
+			log.Printf("Failed to get latest block from %s: %v", peerAddr, err)
+			continue
+		}
+
+		if !resp.Success {
+			log.Printf("Peer %s returned unsuccessful response", peerAddr)
+			continue
+		}
+
+		peerHeight := int(resp.Height)
+		log.Printf("Peer %s has height: %d", peerAddr, peerHeight)
+
+		// If peer has newer blocks, sync them
+		if peerHeight > currentHeight {
+			log.Printf("Syncing blocks from height %d to %d", currentHeight+1, peerHeight)
+
+			// For now, just sync the latest block
+			// In a full implementation, you'd sync all missing blocks
+			if resp.Block != nil {
+				block := vn.protoToBlock(resp.Block)
+
+				// Validate and save the block
+				if err := block.ValidateBlock(); err != nil {
+					log.Printf("Invalid block from peer %s: %v", peerAddr, err)
+					continue
+				}
+
+				// Save the block
+				if err := vn.storage.SaveBlock(block); err != nil {
+					log.Printf("Failed to save synced block: %v", err)
+					continue
+				}
+
+				log.Printf("Successfully synced block at height %d from %s", block.Height, peerAddr)
+				return nil
+			}
+		} else if peerHeight == currentHeight {
+			log.Printf("Already synced with peer %s", peerAddr)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("failed to sync from any peer")
+}
+
+// startHTTPServer starts HTTP server for handling leadership notifications
+func (vn *ValidatorNode) startHTTPServer() {
+	log.Printf("Starting HTTP server on :8080")
+
+	// Setup health check endpoint
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "healthy",
+			"node_id": vn.GetID(),
+			"is_leader": vn.IsLeaderNode(),
+		})
+	})
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: nil,
+	}
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("HTTP server error: %v", err)
+	}
+}
+
+// requestLeadershipFromRegistry requests leadership status from registry
+func (vn *ValidatorNode) requestLeadershipFromRegistry(registryURL string) {
+	// Wait a bit for node to be fully registered
+	time.Sleep(3 * time.Second)
+	
+	log.Printf("🎯 Requesting leadership from registry...")
+	
+	// Create HTTP client
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	// Prepare request payload
+	payload := map[string]interface{}{
+		"node_id": vn.GetID(),
+		"action":  "request_leadership",
+	}
+	
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal leadership request: %v", err)
+		return
+	}
+	
+	// Send leadership request
+	url := fmt.Sprintf("%s/leadership-request", registryURL)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Failed to create leadership request: %v", err)
+		return
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to send leadership request: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("✅ Leadership request sent successfully")
+	} else {
+		log.Printf("❌ Leadership request failed: HTTP %d", resp.StatusCode)
+	}
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	log.Printf("🚀 STARTING NODE MAIN FUNCTION - DEBUG VERSION")
+
+	// Read environment variables
+	nodeIDEnv := os.Getenv("NODE_ID")
+	if nodeIDEnv == "" {
+		log.Fatal("NODE_ID environment variable is required")
+	}
+
+	portEnv := os.Getenv("PORT")
+	if portEnv == "" {
+		portEnv = "50051"
+	}
+
+	// Parse peers from environment or use auto-discovery
+	var peers []string
+	peersEnv := os.Getenv("PEERS")
+	registryURL := os.Getenv("REGISTRY_URL")
+
+	isLeaderStr := os.Getenv("IS_LEADER")
+	autoDiscover := os.Getenv("AUTO_DISCOVER") == "true"
+	
+	log.Printf("🔍 DEBUG: isLeaderStr='%s', autoDiscover=%v, registryURL='%s'", isLeaderStr, autoDiscover, registryURL)
+	
+	// Smart leadership determination
+	var isLeader bool
+	if autoDiscover && registryURL != "" {
+		// In auto-discovery mode, let registry determine leadership
+		// Node starts as follower and can be promoted later
+		isLeader = false
+		log.Printf("Auto-discovery mode: Starting as follower, registry will manage leadership")
+	} else {
+		// In static mode, use environment variable
+		isLeader = isLeaderStr == "true"
+		log.Printf("Static mode: Using configured leadership status: %v", isLeader)
+	}
+
+	if autoDiscover && registryURL != "" {
+		// Use auto-discovery mode - ignore static peers
+		log.Printf("Auto-discovery mode enabled, ignoring static peers")
+	} else if peersEnv != "" {
+		// Use static peer configuration
+		peers = strings.Split(peersEnv, ",")
+		log.Printf("Using static peers: %v", peers)
+	}
+
+	// Create database path
+	dbPath := fmt.Sprintf("./data/%s", nodeIDEnv)
+
+	log.Printf("🚀 Starting Validator Node %s", nodeIDEnv)
+	log.Printf("   Leader: %v", isLeader)
+	log.Printf("   Port: %s", portEnv)
+	log.Printf("   Database: %s", dbPath)
+	log.Printf("   Registry URL: %s", registryURL)
+	log.Printf("   Auto-discover: %v", autoDiscover)
+
+	// Create validator node
+	node, err := NewValidatorNode(nodeIDEnv, "0.0.0.0", portEnv, isLeader, dbPath)
+	if err != nil {
+		log.Fatalf("Failed to create validator node: %v", err)
+	}
+
+	// Start the node
+	err = node.Start()
+	if err != nil {
+		log.Fatalf("Failed to start node: %v", err)
+	}
+
+	// Start HTTP server for all nodes (for leadership notifications)
+	go node.startHTTPServer()
+
+	// Setup auto-discovery if enabled
+	if autoDiscover && registryURL != "" {
+		err = node.setupAutoDiscovery(registryURL)
+		if err != nil {
+			log.Printf("Warning: Failed to setup auto-discovery: %v", err)
+		}
+		
+		// If this was originally a leader node, request leadership from registry
+		if isLeaderStr == "true" {
+			log.Printf("Node was originally configured as leader, requesting leadership from registry...")
+			go node.requestLeadershipFromRegistry(registryURL)
+		}
+	} else {
+		// Setup leadership endpoint even for static nodes
+		node.setupLeadershipEndpoint()
+	}
 
 	// Connect to peers
 	if len(peers) > 0 {
-		log.Printf("Connecting to peers: %v", peers)
-		if err := node.ConnectToPeers(peers); err != nil {
+		err = node.ConnectToPeers(peers)
+		if err != nil {
 			log.Printf("Warning: Failed to connect to some peers: %v", err)
 		}
 	}
 
-	// Sync with peers if not leader
-	if !isLeader && len(peers) > 0 {
-		time.Sleep(3 * time.Second) // Wait for connections
-		if err := node.SyncWithPeers(); err != nil {
-			log.Printf("Warning: Sync failed: %v", err)
+	// Sync with network if auto-discovery is enabled
+	if autoDiscover {
+		go node.performAutoSync()
+	} else {
+		// Traditional sync for static configuration
+		err = node.SyncWithPeers()
+		if err != nil {
+			log.Printf("Warning: Failed to sync with peers: %v", err)
 		}
 	}
 
-	// Start consensus for leader
-	node.StartConsensusLoop()
-
-	log.Printf("Validator node %s is ready", nodeID)
+	// Start consensus if leader
+	if isLeader {
+		node.StartConsensusLoop()
+	}
 
 	// Wait for shutdown signal
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Printf("Shutting down validator node %s", nodeID)
-	node.Stop()
+	log.Printf("Node %s is running. Press Ctrl+C to stop.", nodeIDEnv)
+	<-sigChan
+
+	log.Printf("Shutting down node %s...", nodeIDEnv)
 }
 
 func getEnvOrDefault(key, defaultValue string) string {

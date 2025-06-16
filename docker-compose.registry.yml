@@ -1,0 +1,116 @@
+version: '3.8'
+
+services:
+  # Registry service for auto-scaling and node discovery
+  registry:
+    build:
+      context: .
+      dockerfile: Dockerfile.registry
+    container_name: registry
+    ports:
+      - '9090:9090'
+    environment:
+      - PORT=9090
+      - MIN_NODES=2
+      - MAX_NODES=10
+      - DOCKER_NETWORK=golang-blockchain_blockchain_network
+      - DOCKER_IMAGE=golang-blockchain-node
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Access to Docker daemon
+    networks:
+      - blockchain_network
+    privileged: true
+    user: root # Run as root to access Docker socket
+
+  # Leader node (node1) - auto-discovery
+  node1:
+    build: .
+    container_name: node1
+    ports:
+      - '50051:50051'
+      - '8081:8080'
+    environment:
+      - NODE_ID=node1
+      - IS_LEADER=true
+      - PORT=50051
+      - REGISTRY_URL=http://registry:9090
+      - AUTO_DISCOVER=true
+    volumes:
+      - node1_data:/app/data
+    networks:
+      - blockchain_network
+    healthcheck:
+      test: ['CMD', 'nc', '-z', 'localhost', '50051']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      - registry
+
+  # Follower node (node2) - auto-discovery
+  node2:
+    build: .
+    container_name: node2
+    ports:
+      - '50052:50051'
+      - '8082:8080'
+    environment:
+      - NODE_ID=node2
+      - IS_LEADER=false
+      - PORT=50051
+      - REGISTRY_URL=http://registry:9090
+      - AUTO_DISCOVER=true
+    volumes:
+      - node2_data:/app/data
+    networks:
+      - blockchain_network
+    healthcheck:
+      test: ['CMD', 'nc', '-z', 'localhost', '50051']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      - registry
+
+  # Follower node (node3) - auto-discovery
+  node3:
+    build: .
+    container_name: node3
+    ports:
+      - '50053:50051'
+      - '8083:8080'
+    environment:
+      - NODE_ID=node3
+      - IS_LEADER=false
+      - PORT=50051
+      - REGISTRY_URL=http://registry:9090
+      - AUTO_DISCOVER=true
+    volumes:
+      - node3_data:/app/data
+    networks:
+      - blockchain_network
+    healthcheck:
+      test: ['CMD', 'nc', '-z', 'localhost', '50051']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      - registry
+
+volumes:
+  node1_data:
+    driver: local
+  node2_data:
+    driver: local
+  node3_data:
+    driver: local
+
+networks:
+  blockchain_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

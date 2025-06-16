@@ -1,104 +1,118 @@
 package blockchain
 
 import (
-	"crypto/sha256"
 	"fmt"
+
+	"github.com/cbergoon/merkletree"
 )
 
-// MerkleNode đại diện cho một node trong Merkle Tree
-type MerkleNode struct {
-	Left  *MerkleNode
-	Right *MerkleNode
-	Hash  []byte
+// TransactionContent implements the Content interface required by cbergoon/merkletree
+type TransactionContent struct {
+	tx *Transaction
 }
 
-// MerkleTree đại diện cho Merkle Tree
+// CalculateHash implements merkletree.Content interface
+func (tc TransactionContent) CalculateHash() ([]byte, error) {
+	return tc.tx.Hash(), nil
+}
+
+// Equals implements merkletree.Content interface
+func (tc TransactionContent) Equals(other merkletree.Content) (bool, error) {
+	otherTc, ok := other.(TransactionContent)
+	if !ok {
+		return false, nil
+	}
+	return bytesEqual(tc.tx.Hash(), otherTc.tx.Hash()), nil
+}
+
+// MerkleTree wrapper struct to maintain compatibility with existing code
 type MerkleTree struct {
-	Root *MerkleNode
+	tree         *merkletree.MerkleTree
+	transactions []*Transaction
 }
 
-// NewMerkleTree tạo Merkle Tree từ danh sách transactions
+// NewMerkleTree creates a new Merkle Tree using cbergoon/merkletree library
+// Maintains the same API interface as the original implementation
 func NewMerkleTree(transactions []*Transaction) *MerkleTree {
-	var nodes []*MerkleNode
+	// Handle empty transactions
+	if len(transactions) == 0 {
+		// Create a dummy transaction for empty case
+		return &MerkleTree{
+			tree:         nil,
+			transactions: transactions,
+		}
+	}
 
-	// Tạo leaf nodes từ transaction hashes
+	// Convert transactions to Content interface
+	var contents []merkletree.Content
 	for _, tx := range transactions {
-		node := &MerkleNode{
-			Hash: tx.Hash(),
-		}
-		nodes = append(nodes, node)
+		contents = append(contents, TransactionContent{tx: tx})
 	}
 
-	// Nếu số nodes lẻ, duplicate node cuối
-	if len(nodes)%2 == 1 {
-		nodes = append(nodes, &MerkleNode{Hash: nodes[len(nodes)-1].Hash})
+	// Create the merkle tree
+	tree, err := merkletree.NewTree(contents)
+	if err != nil {
+		// Fallback to nil tree if creation fails
+		return &MerkleTree{
+			tree:         nil,
+			transactions: transactions,
+		}
 	}
 
-	// Xây dựng tree từ bottom lên top
-	for len(nodes) > 1 {
-		var nextLevel []*MerkleNode
-
-		for i := 0; i < len(nodes); i += 2 {
-			left := nodes[i]
-			right := nodes[i+1]
-
-			// Tạo parent node
-			parent := &MerkleNode{
-				Left:  left,
-				Right: right,
-				Hash:  hashPair(left.Hash, right.Hash),
-			}
-
-			nextLevel = append(nextLevel, parent)
-		}
-
-		// Nếu next level có số nodes lẻ, duplicate node cuối
-		if len(nextLevel)%2 == 1 && len(nextLevel) > 1 {
-			nextLevel = append(nextLevel, &MerkleNode{Hash: nextLevel[len(nextLevel)-1].Hash})
-		}
-
-		nodes = nextLevel
+	return &MerkleTree{
+		tree:         tree,
+		transactions: transactions,
 	}
-
-	return &MerkleTree{Root: nodes[0]}
 }
 
-// hashPair hash 2 byte arrays với nhau
-func hashPair(left, right []byte) []byte {
-	combined := append(left, right...)
-	hash := sha256.Sum256(combined)
-	return hash[:]
-}
-
-// GetRootHash trả về root hash của Merkle Tree
+// GetRootHash returns the root hash of the Merkle Tree
 func (mt *MerkleTree) GetRootHash() []byte {
-	if mt.Root == nil {
-		return nil
+	if mt.tree == nil {
+		// Return empty hash for nil tree
+		return make([]byte, 32)
 	}
-	return mt.Root.Hash
+	return mt.tree.MerkleRoot()
 }
 
-// VerifyTransaction kiểm tra transaction có trong tree không
+// VerifyTransaction checks if a transaction exists in the tree
 func (mt *MerkleTree) VerifyTransaction(txHash []byte) bool {
-	return mt.searchHash(mt.Root, txHash)
-}
-
-// searchHash tìm kiếm hash trong tree
-func (mt *MerkleTree) searchHash(node *MerkleNode, targetHash []byte) bool {
-	if node == nil {
+	if mt.tree == nil {
 		return false
 	}
 
-	// So sánh hash
-	if bytesEqual(node.Hash, targetHash) {
-		return true
+	// Find the transaction with matching hash
+	for _, tx := range mt.transactions {
+		if bytesEqual(tx.Hash(), txHash) {
+			content := TransactionContent{tx: tx}
+			verified, err := mt.tree.VerifyContent(content)
+			return err == nil && verified
+		}
 	}
-
-	// Tìm kiếm trong left và right subtree
-	return mt.searchHash(node.Left, targetHash) || mt.searchHash(node.Right, targetHash)
+	return false
 }
 
-// bytesEqual so sánh 2 byte arrays
+// PrintTree prints the tree structure (for debugging)
+func (mt *MerkleTree) PrintTree() {
+	if mt.tree == nil {
+		fmt.Println("Merkle Tree: nil")
+		return
+	}
+
+	fmt.Println("Merkle Tree Structure:")
+	fmt.Printf("Root Hash: %x\n", mt.GetRootHash()[:8])
+	fmt.Printf("Number of transactions: %d\n", len(mt.transactions))
+
+	// Print some transaction hashes
+	for i, tx := range mt.transactions {
+		if i >= 3 { // Show max 3 transactions
+			fmt.Printf("... and %d more transactions\n", len(mt.transactions)-3)
+			break
+		}
+		fmt.Printf("TX%d Hash: %x\n", i+1, tx.Hash()[:8])
+	}
+}
+
+// bytesEqual compares two byte arrays for equality
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -109,29 +123,4 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
-}
-
-// PrintTree in cấu trúc tree (để debug)
-func (mt *MerkleTree) PrintTree() {
-	fmt.Println("Merkle Tree Structure:")
-	mt.printNode(mt.Root, 0)
-}
-
-// printNode in node với indentation
-func (mt *MerkleTree) printNode(node *MerkleNode, level int) {
-	if node == nil {
-		return
-	}
-
-	indent := ""
-	for i := 0; i < level; i++ {
-		indent += "  "
-	}
-
-	fmt.Printf("%sHash: %x\n", indent, node.Hash[:8]) // Chỉ in 8 bytes đầu
-
-	if node.Left != nil || node.Right != nil {
-		mt.printNode(node.Left, level+1)
-		mt.printNode(node.Right, level+1)
-	}
 }

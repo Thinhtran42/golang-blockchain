@@ -1,0 +1,41 @@
+# Dockerfile for Registry Service
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies
+RUN apk add --no-cache git
+
+# Copy go.mod and go.sum
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the registry application
+RUN CGO_ENABLED=0 GOOS=linux go build -o registry ./cmd/registry
+
+# Runtime stage
+FROM alpine:latest
+
+# Install Docker CLI for container management
+RUN apk add --no-cache docker-cli netcat-openbsd curl jq
+
+WORKDIR /app
+
+# Copy the binary
+COPY --from=builder /app/registry .
+
+# Make registry executable
+RUN chmod +x ./registry
+
+# Run as root to access Docker socket
+# In production, you might want to use a more secure approach
+USER root
+
+EXPOSE 9090
+
+CMD ["./registry"]
